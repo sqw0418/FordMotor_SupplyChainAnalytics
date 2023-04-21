@@ -255,14 +255,14 @@ def process_directory(directory_path):
     # parent_directory = str(directory_path).split('/')[-1]
     # !mkdir -p test_resized_{RESIZE_TO[0]}/{parent_directory}
     parent_directory = '10008'
-    if Path(f'D:/work/huaxia/RSNA_Screening/data/test_resized_{RESIZE_TO[0]}/{parent_directory}').exists():
+    if Path(f'datapath').exists():
         pass
     else:
-        os.makedirs(f'D:/work/huaxia/RSNA_Screening/data/test_resized_{RESIZE_TO[0]}/{parent_directory}')
+        os.makedirs(f'datapath')
     for image_path in directory_path:
         processed_ary = dicom_file_to_ary(image_path)
         cv2.imwrite(
-            f'D:/work/huaxia/RSNA_Screening/data/test_resized_{RESIZE_TO[0]}/{parent_directory}/{image_path.stem}.png',
+            f'datapath',
             processed_ary)
 
 class RGB(nn.Module):
@@ -449,7 +449,7 @@ def get_learning_rate(optimizer):
     return optimizer.param_groups[0]['lr']
 
 image_size = 1024 # 512  1024
-image_dir = '/data/fx2566/RSNA_Breast1024/output' # '/data/fx2566/RSNA_Breast512' # '/data/fx2566/RSNA_Breast1024/output' #512x512  # images gai
+image_dir = 'datapath' # 'datapath' # 'datapath' #512x512  # images gai
 
 from PIL import Image
 from PIL import ImageFile
@@ -468,7 +468,7 @@ def read_data(d):
     #image = clahe.apply(image)
     return image
 
-image_cutoff_dir = '/data/fx2566/RSNA_Breast1024_cutoff'  # gai
+image_cutoff_dir = 'filepath'  # gai
 image_size_cutoff = (768,1536) # gai (1024,512)  (1536,768)  # gai 之前错了
 def read_cutoff_data(d,image_size_cutoff):
     image = cv2.imread(f'{image_cutoff_dir}/{d.patient_id}/{d.image_id}.png',cv2.IMREAD_GRAYSCALE)
@@ -837,7 +837,7 @@ if __name__=="__main__":
             )
             #####################################
             # W train
-            out_dir = '/data/fx2566/project/RSNA_Screening/models/effv2_s/1024/WM_0214'# '/data/fx2566/project/RSNA_Screening/models/effv2_s/1024/WM_0110' # gai
+            out_dir = 'datadatapath'# 'datapath' # gai
             fold_dir = out_dir + f'/fold-{SPLIT}' # 
             start_lr = 1e-4  # 0.0001  gai  3e-4
             skip_save_epoch = 1  # gai 3
