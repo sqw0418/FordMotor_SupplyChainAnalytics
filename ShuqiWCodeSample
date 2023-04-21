@@ -1,0 +1,988 @@
+# https://www.kaggle.com/competitions/rsna-breast-cancer-detection/
+#
+from fastai.vision.learner import *
+from fastai.data.all import *
+from fastai.vision.all import *
+
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from timm import *
+import torchvision
+import torch
+import cv2
+
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import SequentialSampler
+from composer.algorithms import ProgressiveResizing
+from composer.models import composer_timm
+from composer.algorithms import SWA
+from composer.algorithms import CutOut, LabelSmoothing
+from composer import functional as cf
+from composer.trainer import Trainer
+from pdb import set_trace
+from sklearn.model_selection import StratifiedKFold
+from collections import defaultdict
+
+from tqdm import tqdm
+# from tqdm.notebook import tqdm
+import dicomsdl
+import multiprocessing as mp
+
+from composer.utils import reproducibility
+reproducibility.configure_deterministic_mode()
+reproducibility.seed_all(42)
+from composer.loggers import InMemoryLogger
+
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
+
+NUM_EPOCHS = 4 # gai
+NUM_SPLITS = 5 # gai  4,
+RESIZE_TO = (1024, 1024)
+batch_size = 8  # gai 6=》7543   12  8  32
+# DATA_PATH = '*'    # gai
+# TRAIN_IMAGE_DIR = '*'
+# TEST_DICOM_DIR = '*'
+# MODEL_PATH = '*' # gai
+
+# Defining some helper functions  定义一些助手函数
+def pfbeta_torch(preds, labels, beta=1): # F1评价函数
+    if preds.dim() != 2 or (preds.dim() == 2 and preds.shape[1] != 2): raise ValueError('Houston, we got a problem')
+    preds = preds[:, 1]
+    preds = preds.clip(0, 1)
+    y_true_count = labels.sum()
+    ctp = preds[labels == 1].sum()
+    cfp = preds[labels == 0].sum()
+    beta_squared = beta * beta
+    c_precision = ctp / (ctp + cfp)
+    c_recall = ctp / y_true_count
+    if (c_precision > 0 and c_recall > 0):
+        result = (1 + beta_squared) * (c_precision * c_recall) / (beta_squared * c_precision + c_recall)
+        return result
+    else:
+        return 0.0
+
+
+# 利用度量bug，搜索模型输出阈值为多少
+def pfbeta_torch_thresh(preds, labels):
+    optimized_preds = optimize_preds(preds, labels)
+    return pfbeta_torch(optimized_preds, labels)
+
+def optimize_preds(preds, labels=None, thresh=None, return_thresh=False, print_results=False):
+    preds = preds.clone()
+    if labels is not None: without_thresh = pfbeta_torch(preds, labels)
+
+    if not thresh and labels is not None:
+        threshs = np.linspace(0, 1, 101) # 0-1分100份来步进查看
+        f1s = [pfbeta_torch((preds > thr).float(), labels) for thr in threshs] #
+        idx = np.argmax(f1s)
+        thresh, best_pfbeta = threshs[idx], f1s[idx] # 找出得分最大值
+
+    preds = (preds > thresh).float()
+
+    if print_results:
+        print(f'without optimization: {without_thresh}')
+        pfbeta = pfbeta_torch(preds, labels)
+        print(f'with optimization: {pfbeta}')
+        print(f'best_thresh = {thresh}')
+    if return_thresh:
+        return thresh
+    return preds
+
+# data_set
+train_csv = pd.read_csv(f'{DATA_PATH}/train.csv')
+patient_id_any_cancer = train_csv.groupby('patient_id').cancer.max().reset_index() #
+skf = StratifiedKFold(NUM_SPLITS, shuffle=True, random_state=42)
+splits = list(skf.split(patient_id_any_cancer.patient_id, patient_id_any_cancer.cancer)) # 4组每组的序列号
+
+fn2label = {fn: cancer_or_not for fn, cancer_or_not in zip(train_csv['image_id'].astype('str'), train_csv['cancer'])} # 以字典形式，54706个，提取所有标签
+
+def splitting_func(paths,SPLIT): # 分区，paths值为item地址值
+    train = []
+    valid = []
+    for idx, path in enumerate(paths):
+        if int(path.parent.name) in patient_id_any_cancer.iloc[splits[SPLIT][0]].patient_id.values:
+            train.append(idx)
+        else:
+            valid.append(idx)
+    return train, valid
+
+def label_func(path):
+    return fn2label[path.stem] # 提取该图片的标签值
+
+def label_func_df(path):
+    image_name = os.path.splitext(path.split("/")[-1])[0]
+    return fn2label[image_name] # 提取该图片的标签值
+
+def get_items(image_dir_path,SPLIT,train_csv,list_add_flag): # 在各个文件夹里整理出图片
+    items = dict.fromkeys(("items", "cancer"))
+    items['items'] = []
+    items['cancer'] = []
+    for p in get_image_files(image_dir_path): # 得到各个图片的各自路径
+        # items.append(p)
+        items['items'].append(p)
+        items['cancer'].append(train_csv.iloc[train_csv['image_id'].values==int(p.stem)]['cancer'].values[0])
+        if list_add_flag == 1:
+            if p.stem in fn2label and int(p.parent.name) in patient_id_any_cancer.iloc[splits[SPLIT][0]].patient_id.values:
+                if label_func(p) == 1:
+                    for _ in range(5): # 当有癌症图片时，会再额外多加载5张照片到序列里
+                        items.append(p)
+    return items # 输出path列表形式，所有图片的源地址
+
+def get_items_test(image_dir_path):
+    items = dict.fromkeys(("items", "cancer"))
+    items['items'] = []
+    items['cancer'] = []
+    for p in get_image_files(image_dir_path):
+        items['items'].append(p)
+        items['cancer'].append(0)
+    return items
+
+
+aug_data = []
+def get_dataloaders():
+    train_image_path = TRAIN_IMAGE_DIR
+    dblock = DataBlock(
+        blocks    = (ImageBlock, CategoryBlock),
+        get_items = get_items,
+        get_y = label_func,
+        splitter  = splitting_func, # get_items内容会传入此
+        batch_tfms=aug_data.append(Flip()), # 数据增强就是翻转
+    )
+    dsets = dblock.datasets(train_image_path)
+    return dblock.dataloaders(train_image_path, batch_size=batch_size)
+
+class BalanceSampler():
+    def __init__(self, dataset, ratio=8): # gai
+        self.r = ratio-1
+        self.dataset = dataset
+        self.pos_index = np.where(dataset.df.cancer>0)[0]
+        self.neg_index = np.where(dataset.df.cancer==0)[0]
+
+        self.length = self.r*int(np.floor(len(self.neg_index)/self.r))
+    def __iter__(self):
+        pos_index = self.pos_index.copy()
+        neg_index = self.neg_index.copy()
+        np.random.shuffle(pos_index)
+        np.random.shuffle(neg_index)
+
+        neg_index = neg_index[:self.length].reshape(-1,self.r)
+        pos_index = np.random.choice(pos_index, self.length//self.r).reshape(-1,1)
+
+        index = np.concatenate([pos_index,neg_index],-1).reshape(-1)
+        return iter(index)
+    def __len__(self):
+        return self.length
+
+class RSNA_screening_Dataset(Dataset):
+    def __init__(self, df ,  transforms=None,train_flag = True):
+        super().__init__()
+        self.df = df
+        self.transforms = transforms
+        self.train_flag = train_flag
+        self.length = len(self.df['items'])
+    def __len__(self):
+        return self.length
+    def __getitem__(self, id):
+        path = os.path.join(self.df['items'][id])
+        try:
+            image = cv2.imread(path,cv2.IMREAD_COLOR).astype(np.float32)
+            # img = np.transpose(image, (2, 0, 1))
+            if self.transforms is not None:
+                img = self.transforms(image=image)
+                img = img['image']
+        except Exception as ex:
+            print(ex)
+            return None
+        if self.train_flag:
+            y_target = label_func(self.df['items'][id])
+        else:
+            return img,1
+        return img,y_target
+
+from albumentations import *
+from albumentations.pytorch.transforms import ToTensorV2
+p = 1.0
+train_transform = Compose([
+    HorizontalFlip(p=0.5), # 水平
+    # VerticalFlip(p=0.5),
+    # RandomRotate90(p=0.5),
+    # # Morphology
+    ShiftScaleRotate(shift_limit=0, scale_limit=(-0.2, 0.2), rotate_limit=(-30, 30),
+                     interpolation=1, border_mode=0, value=(0, 0, 0), p=0.5),
+    GaussNoise(var_limit=(0, 50.0), mean=0, p=0.5),
+    GaussianBlur(blur_limit=(3, 7), p=0.5), # blur模糊
+    Cutout(num_holes=20, max_h_size=80, max_w_size=80, fill_value=0, always_apply=False, p=0.3), # 随机擦除
+    # # Color
+    # RandomBrightnessContrast(brightness_limit=0.35, contrast_limit=0.5,
+    #                          brightness_by_max=True, p=0.5),
+    # HueSaturationValue(hue_shift_limit=30, sat_shift_limit=30,
+    #                    val_shift_limit=0, p=0.5),
+    # OneOf([
+    #     OpticalDistortion(p=0.3),
+    #     GridDistortion(p=.1),
+    #     IAAPiecewiseAffine(p=0.3),], p=0.3),
+    # gai
+    # ElasticTransform(alpha=5, sigma=50, alpha_affine=50, interpolation=1, border_mode=4,always_apply=False, p=0.3), # 5b升级8b效果V1.0
+    # GridDistortion(num_steps=5, distort_limit=0.05, p=0.3),                                                         # 5b升级8b效果V1.0
+    # CoarseDropout(max_holes=15, max_height=image_size // 20, max_width= image_size // 20,min_holes=5, fill_value=0,
+    #               mask_fill_value=0, p=0.3)  # 5b升级8b效果V1.0
+    Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),p=1.0),
+    ToTensorV2(p=1.0),
+    ], p=p)
+valid_transform = Compose([
+    Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),p=1.0),
+    ToTensorV2(p=1.0),
+    ], p=p)
+
+def load_df_test(RSNA_2022_PATH):
+    df_test = pd.read_csv(f'{RSNA_2022_PATH}/test.csv')
+    return df_test
+
+def dicom_file_to_ary(path):
+    dcm_file = dicomsdl.open(str(path))
+    data = dcm_file.pixelData()
+    data = (data - data.min()) / (data.max() - data.min())
+    if dcm_file.getPixelDataInfo()['PhotometricInterpretation'] == "MONOCHROME1":
+        data = 1 - data
+    data = cv2.resize(data, RESIZE_TO)
+    data = (data * 255).astype(np.uint8)
+    return data
+
+from pathlib import Path
+def process_directory(directory_path):
+    # parent_directory = str(directory_path).split('/')[-1]
+    # !mkdir -p test_resized_{RESIZE_TO[0]}/{parent_directory}
+    parent_directory = '10008'
+    if Path(f'D:/work/huaxia/RSNA_Screening/data/test_resized_{RESIZE_TO[0]}/{parent_directory}').exists():
+        pass
+    else:
+        os.makedirs(f'D:/work/huaxia/RSNA_Screening/data/test_resized_{RESIZE_TO[0]}/{parent_directory}')
+    for image_path in directory_path:
+        processed_ary = dicom_file_to_ary(image_path)
+        cv2.imwrite(
+            f'D:/work/huaxia/RSNA_Screening/data/test_resized_{RESIZE_TO[0]}/{parent_directory}/{image_path.stem}.png',
+            processed_ary)
+
+class RGB(nn.Module):
+    IMAGE_RGB_MEAN = [0.5, 0.5, 0.5]  # [0.485, 0.456, 0.406]  #
+    IMAGE_RGB_STD = [0.5, 0.5, 0.5]  # [0.229, 0.224, 0.225]  #
+
+    def __init__(self, ):
+        super(RGB, self).__init__()
+        self.register_buffer('mean', torch.zeros(1, 3, 1, 1))
+        self.register_buffer('std', torch.ones(1, 3, 1, 1))
+        self.mean.data = torch.FloatTensor(self.IMAGE_RGB_MEAN).view(self.mean.shape)
+        self.std.data = torch.FloatTensor(self.IMAGE_RGB_STD).view(self.std.shape)
+
+    def forward(self, x):
+        x = (x - self.mean) / self.std
+        return x
+
+from composer.models import ComposerModel
+from timm.models.layers.adaptive_avgmax_pool import SelectAdaptivePool2d
+class EffnetV2Model(nn.Module):
+    def __init__(self):
+        super().__init__()   # MONAI形式
+        self.timm_model_name = 'tf_efficientnetv2_s'
+        self.pretrained = True
+        # self.custom_head = nn.Sequential(
+        #                         SelectAdaptivePool2d(pool_type='avg', flatten=Flatten()),
+        #                         nn.Linear(1280,1)) # gai
+        # self.body2 = create_model(self.timm_model_name, pretrained=self.pretrained,
+        #                           num_classes=1,
+        #                           drop_rate=0.2,
+        #                           drop_path_rate=0.0,)
+        self.body2 = create_model(self.timm_model_name, pretrained=self.pretrained,
+                                  num_classes=0,
+                                  drop_rate=0.2,
+                                  drop_path_rate=0.1,)  # drop_path_rate = 0.0  gai
+        # self.effv2_model = nn.Sequential(self.body2, self.custom_head)
+        self.rgb = RGB()
+        self.cancer = nn.Linear(1280, 1) # 1792, gai
+
+    def forward(self, batch):
+        x = batch['image']
+        x = x.expand(-1, 3, -1, -1)
+        x = self.rgb(x)
+        x = self.body2(x)  # 如果num_class为0时，x=(batch_size,1280),如果num_class为2时，x=(batch_size,2)
+        x = self.cancer(x)     # (batch_size,1)
+        cancer = x.reshape(-1) # (batch_size,) # reshape从2维变为1维
+        ########
+        output = {}
+        if  'loss' in self.output_type:
+            loss = F.binary_cross_entropy_with_logits(cancer, batch['cancer'])  # targets.float().half() gai
+            # loss = nn.BCEWithLogitsLoss(pos_weight=torch.as_tensor([1.0]))  # as_tensor([7]),torch.tensor([3])
+            output['bce_loss'] = loss
+
+        if 'inference' in self.output_type:
+            cancer = torch.sigmoid(cancer)
+            cancer = torch.nan_to_num(cancer) # nan值替换为0，inf值替换为3.4028e+38，-inf值替换为-3.4028e+38
+            output['cancer'] = cancer
+        return output
+
+
+from timm.models.efficientnet import *
+class WSNet(nn.Module):
+    def load_pretrain(self, ):
+        pass
+    def __init__(self,):
+        super(WSNet, self).__init__()
+        self.output_type = ['inference', 'loss']
+
+        self.rgb = RGB() # 扩充且归一化
+        self.encoder = efficientnet_b4(pretrained=True,drop_rate = 0.3, drop_path_rate = 0.2)  # gai
+        self.cancer = nn.Linear(1792,1)
+    def forward(self, batch):
+        x = batch['image']
+        # x, targets = batch  #   RSNA_screening_Dataset模式
+        x = x.expand(-1,3,-1,-1) # 其将单个维度扩大成更大维度，即将channel维度变为3维度
+        x = self.rgb(x) #17, 3, 256, 256
+        #------
+        e = self.encoder
+        x = e.forward_features(x)
+        x = F.adaptive_avg_pool2d(x,1)
+        x = torch.flatten(x,1,3)
+        #------
+        feature = x
+        cancer = self.cancer(feature)
+        cancer = cancer.reshape(-1)
+        output = {}
+        if  'loss' in self.output_type:
+            loss = F.binary_cross_entropy_with_logits(cancer, batch['cancer'])  # targets.float().half() gai
+            output['bce_loss'] = loss
+
+        if 'inference' in self.output_type:
+            cancer = torch.sigmoid(cancer)
+            cancer = torch.nan_to_num(cancer) # nan值替换为0，inf值替换为3.4028e+38，-inf值替换为-3.4028e+38
+            output['cancer'] = cancer
+
+        return output
+
+
+import torch.cuda.amp as amp # 自动混合精度
+from sklearn import metrics
+def time_to_str(t, mode='min'):
+    if mode=='min':
+        t  = int(t)/60
+        hr = t//60
+        min = t%60
+        return '%2d hr %02d min'%(hr,min)
+    elif mode=='sec':
+        t   = int(t)
+        min = t//60
+        sec = t%60
+        return '%2d min %02d sec'%(min,sec)
+    else:
+        raise NotImplementedError
+
+def pfbeta(labels, predictions, beta=1):
+    y_true_count = 0
+    ctp = 0
+    cfp = 0
+    for idx in range(len(labels)):
+        prediction = min(max(predictions[idx], 0), 1)
+        if (labels[idx]):
+            y_true_count += 1
+            ctp += prediction
+        else:
+            cfp += prediction
+
+    beta_squared = beta * beta
+    c_precision = ctp / (ctp + cfp)
+    c_recall = ctp / y_true_count
+    if (c_precision > 0 and c_recall > 0):
+        result = (1 + beta_squared) * (c_precision * c_recall) / (beta_squared * c_precision + c_recall)
+        return result
+    else:
+        return 0
+
+def do_valid(net, valid_loader):
+    valid_num = 0
+    valid_loss = 0
+    valid_probability = []
+    valid_truth = []
+    net = net.eval()
+    start_timer = time.time()  # timer()
+    for t, batch in enumerate(valid_loader):
+        net.output_type = ['loss', 'inference']
+        with torch.no_grad():
+            with amp.autocast(enabled=is_amp):
+                batch_size = len(batch['index'])
+                for k in ['image', 'cancer']: batch[k] = batch[k].cuda()
+                output = net(batch)
+                #########################################   RSNA_screening_Dataset模式
+                # X, y = batch
+                # batch_size = len(batch[1])
+                # for k in range(2): batch[k] = batch[k].cuda()
+                # output = net(batch)
+
+                # cancer = torch.sigmoid(output)   # EffnetV2Model模式 gai
+                # cancer = torch.nan_to_num(cancer)
+                # loss0 = net.loss(output,batch).mean()
+                loss0 = output['bce_loss'].mean()  # WSNet模式
+
+        valid_num += batch_size
+        valid_loss += batch_size * loss0.item()
+        valid_truth.append(batch['cancer'].cpu().numpy()) # gai y
+        # valid_probability.append(cancer.data.cpu().numpy())          # EffnetV2Model模式 gai
+        valid_probability.append(output['cancer'].data.cpu().numpy()) # WSNet模式
+
+        print('\r %8d / %d  %s' % (valid_num, len(valid_loader.dataset), time_to_str(time.time() - start_timer, 'sec')),
+              end='', flush=True)
+
+    # assert (valid_num == len(valid_loader.dataset))
+    truth = np.concatenate(valid_truth)
+    probability = np.concatenate(valid_probability)
+
+    loss = valid_loss / valid_num
+    metric = pfbeta(truth, probability, beta=1)
+    auc = metrics.roc_auc_score(truth, probability)
+    print('##################################')
+    print('metric pfbeta:',metric)
+    print('auc:',auc)
+    print('##################################')
+    return [loss, metric, auc, 0]
+
+def get_learning_rate(optimizer):
+    return optimizer.param_groups[0]['lr']
+
+image_size = 1024 # 512  1024
+image_dir = '/data/fx2566/RSNA_Breast1024/output' # '/data/fx2566/RSNA_Breast512' # '/data/fx2566/RSNA_Breast1024/output' #512x512  # images gai
+
+from PIL import Image
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+def read_data(d):
+    image = cv2.imread(f'{image_dir}/{d.patient_id}_{d.image_id}.png',cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        print(f'{image_dir}/{d.patient_id}_{d.image_id}.png')
+        path = f'{image_dir}/{d.patient_id}_{d.image_id}.png'
+        Image.open(path).convert("RGB").save(path)
+        image = cv2.imread(f'{image_dir}/{d.patient_id}_{d.image_id}.png', cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            print('error')
+    #if d.laterality=='R':
+    #    image = cv2.flip(image, 1)
+    #image = clahe.apply(image)
+    return image
+
+image_cutoff_dir = '/data/fx2566/RSNA_Breast1024_cutoff'  # gai
+image_size_cutoff = (768,1536) # gai (1024,512)  (1536,768)  # gai 之前错了
+def read_cutoff_data(d,image_size_cutoff):
+    image = cv2.imread(f'{image_cutoff_dir}/{d.patient_id}/{d.image_id}.png',cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        print(f'{image_cutoff_dir}/{d.patient_id}/{d.image_id}.png')
+        path = f'{image_cutoff_dir}/{d.patient_id}/{d.image_id}.png'
+        Image.open(path).convert("RGB").save(path)
+        image = cv2.imread(f'{image_cutoff_dir}/{d.patient_id}/{d.image_id}.png', cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            print('error')
+    #if d.laterality=='R':
+    #    image = cv2.flip(image, 1)
+    #image = clahe.apply(image)
+    image = cv2.resize(image, image_size_cutoff,interpolation=cv2.INTER_CUBIC)
+    return image
+
+apply_clahe = False  # gai
+apply_eq_hist = False
+
+class RsnaDataset():
+    def __init__(self, df, augment=None):
+        df.loc[:, 'i'] = np.arange(len(df))
+
+        self.length = len(df)
+        self.df = df
+        self.augment = augment
+
+    def __str__(self):
+        num_patient = len(set(self.df.patient_id))
+        num_image = len(self.df)
+
+        string = ''
+        string += f'\tlen = {len(self)}\n'
+        string += f'\tnum_patient = {num_patient}\n'
+        string += f'\tnum_image = {num_image}\n'
+
+        count = dict(self.df.cancer.value_counts())
+        for k in [0,1]:
+            string += f'\t\tcancer{k} = {count[k]:5d} ({count[k]/len(self.df):0.3f})\n'
+        return string
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        d = self.df.iloc[index]
+        # print(d)
+        # image = read_data(d) # gai
+        image = read_cutoff_data(d,image_size_cutoff) # gai
+        # print(image)
+        # Apply CLAHE contrast enhancement  应用CLAHE对比增强
+        # if apply_clahe:
+        #     image = image.astype(np.uint8)
+        #     clahe = cv2.createCLAHE(clipLimit=4, tileGridSize=(10, 5))
+        #     image = clahe.apply(image)
+
+        # Apply Histogram Equalization 应用直方图均衡增强
+        # if apply_eq_hist:
+        #     image = image.astype(np.uint8)
+        #     image = cv2.equalizeHist(image)
+
+        image = image.astype(np.float32)/255
+
+        if self.augment is not None:
+            image = self.augment(image)
+
+        r = {}
+        r['index'] = index
+        r['d'] = d
+        r['patient_id'] = d.patient_id  #
+        r['image' ] = torch.from_numpy(image).float()
+        r['cancer'] = torch.FloatTensor([d.cancer])
+
+        return r
+
+tensor_key = ['image', 'cancer']
+def null_collate(batch):
+    d = {}
+    key = batch[0].keys()
+    for k in key:
+        v = [b[k] for b in batch]
+        if k in tensor_key:
+            v = torch.stack(v,0)
+        d[k] = v
+    d['image']= d['image'].unsqueeze(1)
+    d['cancer']= d['cancer'].reshape(-1)
+    return d
+
+def make_fold(fold=1):
+    df = pd.read_csv('/data/fx2566/project/RSNA_Screening/data/train.csv')
+    patient_id = df.patient_id.unique()
+    patient_id = sorted(patient_id)
+
+    num_fold=5  # gai
+    rs = np.random.RandomState(1234)
+    rs.shuffle(patient_id)
+    patient_id = np.array(patient_id)
+    f = np.arange(len(patient_id))%num_fold
+    train_id = patient_id[f!=fold]
+    valid_id = patient_id[f==fold]
+
+    train_df = df[df.patient_id.isin(train_id)].reset_index(drop=True)
+    valid_df = df[df.patient_id.isin(valid_id)].reset_index(drop=True)
+    return train_df, valid_df
+
+def do_random_hflip(image, ):
+    if np.random.rand()<0.5:
+        image = cv2.flip(image,1) # 水平翻转
+    return image
+
+def do_random_vflip(image, ):
+    if np.random.rand()<0.5:
+        image = cv2.flip(image,0) # 垂直翻转
+    return image
+
+def do_random_hvflip(image, ):
+    if np.random.rand()<0.5:
+        image = cv2.flip(image,-1) # 水平垂直翻转
+    return image
+
+def affine_param_to_matrix(
+    degree=10,
+    scale=0.1,
+    translate=(10,10),
+    shear=(10,10),
+):
+    #h,w = image_shape
+    #https://stackoverflow.com/questions/61242154/the-third-column-of-cv2-getrotationmatrix2d
+    rotate = cv2.getRotationMatrix2D(angle=degree, center=(0, 0), scale=scale)
+
+    # Shear
+    shear_x = math.tan(shear[0] * math.pi / 180)
+    shear_y = math.tan(shear[1] * math.pi / 180)
+
+    matrix = np.ones([2, 3])
+    matrix[0] = rotate[0] + shear_y * rotate[1]
+    matrix[1] = rotate[1] + shear_x * rotate[0]
+    matrix[0, 2] = translate[0]
+    matrix[1, 2] = translate[1]
+    return matrix
+
+def do_random_affine(
+    image,
+    degree=30,
+    translate=0.1,
+    scale=0.2,
+    shear=10,
+):
+    h,w = image.shape[:2]
+    degree = np.random.uniform(-degree, degree)
+    scale  = np.random.uniform(-scale, scale)+1
+    translate_x, translate_y  = np.random.uniform(-translate, translate,2)*[w,h]
+    shear_x, shear_y  = np.random.uniform(-shear, shear,2)
+
+    matrix = affine_param_to_matrix(
+        degree,
+        scale,
+        (translate_x, translate_y),
+        (shear_x, shear_y),
+    )
+    image = cv2.warpAffine( image, matrix, (w,h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return image
+
+def do_random_rotate(image, degree=15, ):
+    degree = np.random.uniform(-degree, degree)
+
+    h, w = image.shape[:2]
+    cx, cy = w // 2, h // 2
+    matrix = cv2.getRotationMatrix2D((cx, cy), -degree, 1.0)
+    image = cv2.warpAffine( image, matrix, (w,h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return image
+
+def do_random_stretch(image, stretch=(0.1,0.2) ):
+    stretchx, stretchy = stretch
+    stretchx = np.random.uniform(-stretchx, stretchx) + 1
+    stretchy = np.random.uniform(-stretchy, stretchy) + 1
+
+    matrix = np.array([
+        [stretchy,0,0],
+        [0,stretchx,1],
+    ])
+    h, w = image.shape[:2]
+    image = cv2.warpAffine( image, matrix, (w,h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return image
+
+from scipy.ndimage import gaussian_filter
+def do_elastic_transform(
+    image,
+    alpha=120,
+    sigma=120* 0.05,
+    alpha_affine=120* 0.03
+
+):
+    """Elastic deformation of images as described in [Simard2003]_ (with modifications).
+    Based on https://gist.github.com/ernestum/601cdf56d2b424757de5
+    .. [Simard2003] Simard, Steinkraus and Platt, "Best Practices for
+         Convolutional Neural Networks applied to Visual Document Analysis", in
+         Proc. of the International Conference on Document Analysis and
+         Recognition, 2003.
+    """
+    height, width = image.shape[:2]
+    # Random affine
+    center_square = np.array((height, width), dtype=np.float32) // 2
+    square_size = min((height, width)) // 3
+    alpha = float(alpha)
+    sigma = float(sigma)
+    alpha_affine = float(alpha_affine)
+    pts1 = np.array(
+        [
+            center_square + square_size,
+            [center_square[0] + square_size, center_square[1] - square_size],
+            center_square - square_size,
+        ],
+        dtype=np.float32,
+    )
+    pts2 = pts1 + np.random.uniform(-alpha_affine, alpha_affine, size=pts1.shape).astype(
+        np.float32
+    )
+    matrix = cv2.getAffineTransform(pts1, pts2)
+
+    image = cv2.warpAffine(image, M=matrix, dsize=(width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    if 1:
+        dx = gaussian_filter((np.random.rand(height, width) * 2 - 1), sigma) * alpha
+        dy = gaussian_filter((np.random.rand(height, width) * 2 - 1), sigma) * alpha
+    x, y = np.meshgrid(np.arange(width), np.arange(height))
+    map_x = np.float32(x + dx)
+    map_y = np.float32(y + dy)
+    image = cv2.remap( image, map1=map_x, map2=map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return image
+
+def do_random_cutout(image, num_block=5, block_size=[0.1,0.3], fill='constant'):
+    height, width = image.shape[:2]
+    num_block = np.random.randint(1,num_block+1)
+    for n in range(num_block):
+        h = np.random.uniform(*block_size)
+        w = np.random.uniform(*block_size)
+        h = int(h*height)
+        w = int(w*width)
+        x = np.random.randint(0,width-w)
+        y = np.random.randint(0,height-h)
+        if fill=='constant':
+            image[y:y+h,x:x+w]=0
+        else:
+            raise NotImplementedError
+    return image
+
+##intensity noise##################
+def do_random_contrast(image):
+    #image = image.astype(np.float32)/255
+    u = np.random.choice(3)
+    if u==0:
+        m = np.random.uniform(-0.3,0.3)
+        image = image*(1+m)
+    if u==1:
+        m = np.random.uniform(-0.5,0.5)
+        image = image**(1+m)
+    if u==2:
+        m = np.random.uniform(-0.2,0.2)
+        image = image + m
+    image = np.clip(image,0,1)
+    #image = (image*255).astype(np.uint8)
+    return image
+
+#noise
+def do_random_noise(image, m=0.08):
+    height, width = image.shape[:2]
+    #image = (image).astype(np.float32)/255
+    noise = np.random.uniform(-1,1,size=(height,width))*m
+    image = image+noise
+    image = np.clip(image,0,1)
+    #image = (image*255).astype(np.uint8)
+    return image
+
+def train_augment_v00(image):
+    image = do_random_hflip(image)  # hflip, vflip or both
+    # image = do_random_vflip(image)  # gai
+    # image = do_random_hvflip(image) # gai
+    #image, target = do_random_hflip(image, target)
+    if np.random.rand() < 0.7:
+        for func in np.random.choice([
+            lambda image : do_random_affine( image, degree=30, translate=0.1, scale=0.3, shear=20),
+            lambda image : do_random_rotate(image,  degree=30),
+            lambda image : do_random_stretch(image, stretch=(0.3,0.3)),
+        ], 1):
+            image = func(image)
+    if np.random.rand() < 0.25:
+        image = do_elastic_transform(
+            image,
+            alpha=image_size,                          #  gai  image_size
+            sigma=image_size* 0.05,                    #
+            alpha_affine=image_size* 0.03              #
+        )
+    if np.random.rand() < 0.25:
+        image = do_random_cutout(
+            image, num_block=5,
+            block_size=[0.1,0.3],
+            fill='constant'
+        )
+    if np.random.rand() < 0.5:
+        for func in np.random.choice([
+            lambda image: do_random_contrast(image),
+            lambda image: do_random_noise(image, m=0.1),
+        ], 1):
+            image = func(image)
+            pass
+    return image
+
+if __name__=="__main__":
+    train_flag = 1
+    is_amp = True
+    eponch_num = 8  # 30  gai  12
+    if train_flag == 1:
+        list_add_flag = 0 # 列表均衡操作
+        for SPLIT in range(2,5): # gai
+            # items = get_items(TRAIN_IMAGE_DIR, SPLIT, train_csv, list_add_flag)
+            # train_id, valid_id = splitting_func(items['items'], SPLIT)
+            # items_df = pd.DataFrame(items)
+            # train_df, valid_df = items_df.iloc[train_id].reset_index(drop=True), items_df.iloc[valid_id].reset_index(
+            #     drop=True)
+            # train_data = RSNA_screening_Dataset(train_df, train_transform, train_flag=True)
+            # test_data = RSNA_screening_Dataset(valid_df, valid_transform, train_flag=True)
+            # train_dataloader = DataLoader(dataset=train_data,
+            #                               sampler=BalanceSampler(train_data,batch_size//1),  # gai   BalanceSampler(train_data) ,每个batch_size里都需要一个正样本
+            #                               batch_size=batch_size,
+            #                               shuffle=False,
+            #                               drop_last=False,
+            #                               num_workers=os.cpu_count(),
+            #                               worker_init_fn=lambda id: np.random.seed(
+            #                                   torch.initial_seed() // 2 ** 32 + id),#
+            #                               )  # gai
+            # test_dataloader = DataLoader(dataset=test_data,
+            #                              sampler=SequentialSampler(test_data),  # gai  SequentialSampler
+            #                              batch_size=batch_size,
+            #                              shuffle=False,
+            #                              drop_last=False,
+            #                              num_workers=os.cpu_count(),
+            #                              worker_init_fn=lambda id: np.random.seed(
+            #                                  torch.initial_seed() // 2 ** 32 + id),#
+            #                              )  # gai
+            ###################
+            # RsnaDataset()模式
+            train_df, valid_df = make_fold(SPLIT)
+            train_dataset = RsnaDataset(train_df, augment=train_augment_v00)
+            valid_dataset = RsnaDataset(valid_df)
+
+            train_dataloader = DataLoader(
+                train_dataset,
+                # sampler = RandomSampler(train_dataset),
+                sampler=BalanceSampler(train_dataset, batch_size // 1),
+                batch_size=batch_size,
+                drop_last=True,
+                num_workers=8,  # gai
+                pin_memory=False,
+                worker_init_fn=lambda id: np.random.seed(torch.initial_seed() // 2 ** 32 + id),
+                collate_fn=null_collate,   # 最终整理数据集
+            )
+
+            test_dataloader = DataLoader(
+                valid_dataset,
+                sampler=SequentialSampler(valid_dataset),
+                batch_size=batch_size, # gai
+                drop_last=False,
+                num_workers=8,  # gai
+                pin_memory=False,
+                collate_fn=null_collate,
+            )
+            #####################################
+            # W train
+            out_dir = '/data/fx2566/project/RSNA_Screening/models/effv2_s/1024/WM_0214'# '/data/fx2566/project/RSNA_Screening/models/effv2_s/1024/WM_0110' # gai
+            fold_dir = out_dir + f'/fold-{SPLIT}' # 
+            start_lr = 1e-4  # 0.0001  gai  3e-4
+            skip_save_epoch = 1  # gai 3
+            initial_checkpoint = \
+                None  # fold_dir + '/checkpoint/00005356.model.pth'  #
+            def scheduler(epoch): # lr与epoch之间的关系
+                # return start_lr
+                num_epoch = 5
+                start_lr = 1e-3
+                min_lr = 1e-5
+                lr = (num_epoch - epoch) / num_epoch * (start_lr - min_lr) + min_lr
+                lr = max(min_lr, lr)
+                return lr
+            for f in ['checkpoint', 'train', 'valid', 'backup']: os.makedirs(fold_dir + '/' + f, exist_ok=True)
+            scaler = amp.GradScaler(enabled=is_amp)
+            # net = EffnetV2Model().cuda()  # gai
+            net = WSNet().cuda()            # WSNet模式
+            # 读取模型信息
+            if initial_checkpoint is not None:
+                f = torch.load(initial_checkpoint, map_location=lambda storage, loc: storage)
+                start_iteration = f['iteration']
+                start_epoch = f['epoch']
+                state_dict = f['state_dict']
+                net.load_state_dict(state_dict, strict=False)  # True
+            else:
+                start_iteration = 0
+                start_epoch = 0
+                # net.load_pretrain()
+
+            optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=start_lr)  # 蛙神 gai
+
+            # monai
+            # optimizer = torch.optim.AdamW(net.parameters(), lr=start_lr, weight_decay=1e-2)
+            # scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            #     optimizer,
+            #     max_lr=start_lr,
+            #     epochs=eponch_num,
+            #     steps_per_epoch=int(len(train_dataset) / batch_size),
+            #     pct_start=0.1,
+            #     anneal_strategy="cos",
+            #     div_factor=1.0,
+            #     final_div_factor=10000.0,
+            # )
+
+            num_iteration = eponch_num * len(train_dataloader) # 训练轮数：多少轮 gai
+            iter_log = int(len(train_dataloader) * 1) # gai
+            iter_valid = iter_log  # 验证轮数
+            iter_save = iter_log   # 保存轮数
+
+            def message(mode='print'):
+                asterisk = ' '
+                if mode == ('print'):
+                    loss = batch_loss
+                if mode == ('log'):
+                    loss = train_loss
+                    if (iteration % iter_save == 0): asterisk = '*'
+                text = \
+                    ('%0.2e   %08d%s %6.2f | ' % (rate, iteration, asterisk, epoch,)).replace('e-0', 'e-').replace(
+                        'e+0', 'e+') + \
+                    '%4.3f  %4.3f  %4.4f  %4.3f   | ' % (*valid_loss,) + \
+                    '%4.3f  %4.3f  %4.3f  | ' % (*loss,) + \
+                    '%s' % (time_to_str(time.time() - start_timer, 'min'))
+                return text
+
+            valid_loss = np.zeros(4, np.float32)
+            train_loss = np.zeros(3, np.float32)
+            batch_loss = np.zeros_like(train_loss)
+            sum_train_loss = np.zeros_like(train_loss)
+            sum_train = 0
+            start_timer = time.time()  # timer()
+            iteration = start_iteration
+            epoch = start_epoch
+            rate = 0
+
+            log = open(fold_dir + '/log.train.txt', mode='a')
+            log.write(f'\tfold_dir = {fold_dir}\n')
+            log.write('\n')
+            log.write('\tinitial_checkpoint = %s\n' % initial_checkpoint)
+            log.write('\n')
+            log.write('optimizer\n  %s\n' % (optimizer))
+            log.write('\n')
+            log.write('** start training here! **\n')
+            log.write('   batch_size = %d \n' % (batch_size))
+            log.write('                     |-------------- VALID---------|---- TRAIN/BATCH ----------------\n')
+            log.write('rate     iter  epoch | dice   loss   tp     tn     | loss           | time           \n')
+            log.write('-------------------------------------------------------------------------------------\n')
+
+            while iteration < num_iteration:
+                for t, batch in enumerate(train_dataloader):
+                    if iteration % iter_save == 0:
+                        if epoch < skip_save_epoch:
+                            n = 0
+                        else:
+                            n = iteration
+                        if iteration != start_iteration:
+                            torch.save({
+                                'state_dict': net.state_dict(),
+                                'iteration': iteration,
+                                'epoch': epoch,
+                            }, f'{fold_dir}/checkpoint/{n:08d}.model.pth')
+                            pass
+                    if (iteration % iter_valid == 0):  # or (t==len(train_loader)-1):
+                        # if iteration!=start_iteration:
+                        valid_loss = do_valid(net, test_dataloader)  #
+                        pass
+                    if (iteration % iter_log == 0) or (iteration % iter_valid == 0):
+                        print('\r', end='', flush=True)
+                        log.write(message(mode='log') + '\n')
+
+                    rate = get_learning_rate(optimizer)
+                    print('lr:',rate)
+                    # batch_size = len(batch[1])
+                    # for k in range(2): batch[k] = batch[k].cuda() #  gai RSNA_screening_Dataset模式
+                    batch_size = len(batch['index'])
+                    for k in ['image', 'cancer']: batch[k] = batch[k].cuda() #
+                    net.train()
+                    net.output_type = ['loss', 'inference']  # WSNet模式 gai
+                    if 1:
+                        with amp.autocast(enabled=is_amp):
+                            output = net(batch)  # output = data_parallel(net,batch)
+                            # loss0 = net.loss(output,batch).mean() # EffnetV2Model模式
+                            loss0 = output['bce_loss'].mean() # WSNet模式 gai
+
+                        optimizer.zero_grad()
+                        scaler.scale(loss0).backward()
+                        scaler.unscale_(optimizer)
+                        # torch.nn.utils.clip_grad_norm_(net.parameters(), 2)
+                        scaler.step(optimizer)
+                        scaler.update()
+
+                        # scheduler.step() # monai gai
+
+                    # print statistics  --------
+                    batch_loss[:3] = [loss0.item(), 0, 0]
+                    sum_train_loss += batch_loss
+                    sum_train += 1
+                    if t % 100 == 0:
+                        train_loss = sum_train_loss / (sum_train + 1e-12)
+                        sum_train_loss[...] = 0
+                        sum_train = 0
+
+                    print('\r', end='', flush=True)
+                    print(message(mode='print'), end='', flush=True)
+                    epoch += 1 / len(train_dataloader)
+                    iteration += 1
+
+        torch.cuda.empty_cache()
+    log.write('\n')
