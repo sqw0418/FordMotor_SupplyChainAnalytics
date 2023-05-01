@@ -1,7 +1,7 @@
 # FordMotor_SupplyChainAnalytics
 
 The file ReportSample is a phase report about my recent project at Huaxia Bank. It is really tedious!
-MindMapping is a concise Version. ;)
+MindMapping is a concise Version. ：)
 
 
 The file CodeSample_ShuqiW contains a practice project where the data and competition details can be found on Kaggle using the following link: 
