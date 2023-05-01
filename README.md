@@ -1,5 +1,7 @@
 # FordMotor_SupplyChainAnalytics
 
+The files which start with with MktLiquidity are about my recent project at Huaxia Bank, including a phase report, poster and code sample.
+
 The file CodeSample_ShuqiW contains a practice project where the data and competition details can be found on Kaggle using the following link: 
 https://www.kaggle.com/competitions/rsna-breast-cancer-detection/overview
 
